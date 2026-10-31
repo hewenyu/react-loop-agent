@@ -1,0 +1,9 @@
+bin/
+*.test
+*.out
+.DS_Store
+.env
+
+app/node_modules/
+app/out/
+app/dist/

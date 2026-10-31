@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { call } from "./api";
+import { useEffect, useId, useState } from "react";
+import { call, message } from "./api";
+import { REPO_CONCURRENCY_MAX, REPO_CONCURRENCY_MIN } from "./constants";
 import { base } from "./format";
 import type { Repo } from "./types";
 
@@ -10,20 +11,36 @@ export function NewTask({ repos, onClose }: { repos: Repo[]; onClose: () => void
   const [prompt, setPrompt] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  const id = useId();
+  const canSubmit = !busy && !!cwd && !!prompt.trim();
+
+  // Esc closes the dialog, as clicking outside it does.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const pick = async () => {
-    const p = await window.rla.pickFolder();
-    if (p) setCwd(p);
+    try {
+      const p = await window.rla.pickFolder();
+      if (p) setCwd(p);
+    } catch (e) {
+      setErr(message(e));
+    }
   };
 
   const submit = async () => {
+    if (!canSubmit) return;
     setBusy(true);
     setErr("");
     try {
       await call("POST", "/api/tasks", { cwd, title, prompt });
       onClose();
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(message(e));
     } finally {
       setBusy(false);
     }
@@ -31,11 +48,17 @@ export function NewTask({ repos, onClose }: { repos: Repo[]; onClose: () => void
 
   return (
     <div className="modal-back" onMouseDown={onClose}>
-      <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
-        <h2>新任务</h2>
-        <label>目录</label>
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={`${id}-head`}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <h2 id={`${id}-head`}>新任务</h2>
+        <label htmlFor={`${id}-cwd`}>目录</label>
         <div className="row">
-          <select value={repos.some((r) => r.path === cwd) ? cwd : ""} onChange={(e) => setCwd(e.target.value)}>
+          <select id={`${id}-cwd`} value={repos.some((r) => r.path === cwd) ? cwd : ""} onChange={(e) => setCwd(e.target.value)}>
             {!repos.some((r) => r.path === cwd) && <option value="">{cwd || "选择目录…"}</option>}
             {repos.map((r) => (
               <option key={r.path} value={r.path}>
@@ -47,17 +70,21 @@ export function NewTask({ repos, onClose }: { repos: Repo[]; onClose: () => void
             选择…
           </button>
         </div>
-        <label>标题（可选）</label>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="不填就用描述的第一行" />
-        <label>要做什么</label>
+        <label htmlFor={`${id}-title`}>标题（可选）</label>
+        <input id={`${id}-title`} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="不填就用描述的第一行" />
+        <label htmlFor={`${id}-prompt`}>要做什么</label>
         <textarea
+          id={`${id}-prompt`}
           className="tall"
           autoFocus
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           placeholder="像交代给同事一样写清楚：目标、范围、怎么算完成。⌘+回车提交"
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submit();
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              void submit();
+            }
           }}
         />
         {err && <div className="card-note bad">{err}</div>}
@@ -65,7 +92,7 @@ export function NewTask({ repos, onClose }: { repos: Repo[]; onClose: () => void
           <button className="ghost" onClick={onClose}>
             取消
           </button>
-          <button className="primary" disabled={busy || !cwd || !prompt.trim()} onClick={() => void submit()}>
+          <button className="primary" disabled={!canSubmit} onClick={() => void submit()}>
             排队
           </button>
         </div>
@@ -84,21 +111,49 @@ export function Repos({ repos }: { repos: Repo[] }) {
     try {
       await call("POST", "/api/repos", r);
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(message(e));
     }
   };
 
   const add = async () => {
-    const p = await window.rla.pickFolder();
-    if (p) await save({ path: p, claude_bot: false, concurrency: 1 });
+    setErr("");
+    try {
+      const p = await window.rla.pickFolder();
+      // Adding a repo again would reset its settings.
+      if (p && !repos.some((r) => r.path === p)) {
+        await save({ path: p, claude_bot: false, concurrency: REPO_CONCURRENCY_MIN });
+      }
+    } catch (e) {
+      setErr(message(e));
+    }
   };
 
   const remove = async (path: string) => {
+    setErr("");
     try {
       await call("DELETE", `/api/repos?path=${encodeURIComponent(path)}`);
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(message(e));
     }
+  };
+
+  const reveal = async (path: string) => {
+    setErr("");
+    try {
+      const msg = await window.rla.reveal(path);
+      if (msg) setErr(msg);
+    } catch (e) {
+      setErr(message(e));
+    }
+  };
+
+  // The field is the daemon's value: a cleared or out-of-range entry is
+  // saved as the nearest allowed number.
+  const setConcurrency = (r: Repo, v: string) => {
+    const n = Math.round(Number(v));
+    if (!v || !Number.isFinite(n)) return;
+    const c = Math.min(REPO_CONCURRENCY_MAX, Math.max(REPO_CONCURRENCY_MIN, n));
+    if (c !== r.concurrency) void save({ ...r, concurrency: c });
   };
 
   return (
@@ -131,14 +186,14 @@ export function Repos({ repos }: { repos: Repo[] }) {
             同时
             <input
               type="number"
-              min={1}
-              max={8}
+              min={REPO_CONCURRENCY_MIN}
+              max={REPO_CONCURRENCY_MAX}
               value={r.concurrency}
-              onChange={(e) => void save({ ...r, concurrency: Math.max(1, Number(e.target.value) || 1) })}
+              onChange={(e) => setConcurrency(r, e.target.value)}
             />
             个
           </label>
-          <button className="ghost" onClick={() => void window.rla.reveal(r.path)}>
+          <button className="ghost" onClick={() => void reveal(r.path)}>
             打开
           </button>
           <button className="ghost danger" onClick={() => void remove(r.path)}>

@@ -1,44 +1,53 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDaemonState } from "./api";
 import { AgentView } from "./AgentView";
 import { Board } from "./Board";
+import { NOTIFY_BODY_MAX, SIDEBAR_ENDED_AGENTS } from "./constants";
 import { NewTask, Repos } from "./Forms";
 import { agentLabel, base, tone } from "./format";
-import type { Agent, State, Task } from "./types";
+import type { Agent, AgentStatus, State, Task } from "./types";
 
 export type View = { kind: "board" } | { kind: "repos" } | { kind: "agent"; id: string };
 
+// Stable empty lists, so memos keyed on them hold until there is state.
+const noAgents: Agent[] = [];
+const noTasks: Task[] = [];
+
 export function App() {
-  const { state, online } = useDaemonState();
+  const { state, online, error } = useDaemonState();
   const [view, setView] = useState<View>({ kind: "board" });
   const [tabs, setTabs] = useState<string[]>([]);
   const [adding, setAdding] = useState(false);
 
-  const agents = state?.agents ?? [];
-  const tasks = state?.tasks ?? [];
+  const agents = state?.agents ?? noAgents;
+  const tasks = state?.tasks ?? noTasks;
   const repos = state?.repos ?? [];
 
-  useNotifications(state, (id) => openAgent(id));
-
-  const openAgent = (id: string) => {
+  const openAgent = useCallback((id: string) => {
     setTabs((t) => (t.includes(id) ? t : [...t, id]));
     setView({ kind: "agent", id });
-  };
+  }, []);
+
+  // openAgent is stable, so notifications compare states only when the
+  // state changes.
+  useNotifications(state, openAgent);
 
   const closeTab = (id: string) => {
     setTabs((t) => t.filter((x) => x !== id));
-    if (view.kind === "agent" && view.id === id) setView({ kind: "board" });
+    setView((v) => (v.kind === "agent" && v.id === id ? { kind: "board" } : v));
   };
 
   // Agents that disappear (removed) close their tabs.
   useEffect(() => {
     if (!state) return;
     const ids = new Set(agents.map((a) => a.id));
-    setTabs((t) => t.filter((id) => ids.has(id)));
-    if (view.kind === "agent" && !ids.has(view.id)) setView({ kind: "board" });
-  }, [state]);
+    setTabs((t) => (t.every((id) => ids.has(id)) ? t : t.filter((id) => ids.has(id))));
+    setView((v) => (v.kind === "agent" && !ids.has(v.id) ? { kind: "board" } : v));
+  }, [state, agents]);
 
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
+  const current = view.kind === "agent" ? byId.get(view.id) : undefined;
+  const closeNew = useCallback(() => setAdding(false), []);
 
   return (
     <div className="app">
@@ -78,20 +87,30 @@ export function App() {
         </header>
         <section className="content">
           {!state ? (
-            <div className="empty">{online ? "加载中…" : "正在连接 rla daemon…"}</div>
+            <div className="empty">
+              <p>{online ? "加载中…" : "正在连接 rla daemon…"}</p>
+              {error && <p className="muted small">{error}</p>}
+            </div>
           ) : view.kind === "board" ? (
             <Board tasks={tasks} agents={byId} onAgent={openAgent} onNew={() => setAdding(true)} />
           ) : view.kind === "repos" ? (
             <Repos repos={repos} />
-          ) : byId.get(view.id) ? (
-            <AgentView agent={byId.get(view.id)!} task={tasks.find((t) => t.agent_id === view.id && t.id === byId.get(view.id)!.task_id)} />
+          ) : current ? (
+            <AgentView
+              key={current.id}
+              agent={current}
+              task={current.task_id ? tasks.find((t) => t.id === current.task_id && t.agent_id === current.id) : undefined}
+            />
           ) : null}
         </section>
       </main>
-      {adding && <NewTask repos={repos} onClose={() => setAdding(false)} />}
+      {adding && <NewTask repos={repos} onClose={closeNew} />}
     </div>
   );
 }
+
+// Live agents are listed by who needs attention first.
+const sidebarOrder: Record<AgentStatus, number> = { blocked: 0, working: 1, starting: 2, idle: 3, lost: 4, exited: 5 };
 
 function Sidebar(p: {
   agents: Agent[];
@@ -105,21 +124,25 @@ function Sidebar(p: {
 }) {
   const count = (f: (t: Task) => boolean) => p.tasks.filter(f).length;
   const live = p.agents.filter((a) => a.status !== "exited");
-  const ended = p.agents.filter((a) => a.status === "exited").slice(-8).reverse();
-  const order = { blocked: 0, working: 1, starting: 2, idle: 3, lost: 4, exited: 5 } as const;
-  live.sort((a, b) => order[a.status] - order[b.status]);
+  const ended = p.agents.filter((a) => a.status === "exited").slice(-SIDEBAR_ENDED_AGENTS).reverse();
+  live.sort((a, b) => sidebarOrder[a.status] - sidebarOrder[b.status]);
 
   return (
     <aside className="sidebar">
       <div className="brand">
         <span className="logo">◆</span> RLA 调度台
-        <span className={`conn ${p.online ? "ok" : "bad"}`} title={p.online ? "已连接 daemon" : "daemon 未连接"} />
+        <span
+          className={`conn ${p.online ? "ok" : "bad"}`}
+          role="status"
+          title={p.online ? "已连接 daemon" : "daemon 未连接"}
+          aria-label={p.online ? "已连接 daemon" : "daemon 未连接"}
+        />
       </div>
-      <div className="stats" onClick={p.onBoard}>
+      <button className="stats" onClick={p.onBoard} title="打开任务看板">
         <Stat n={count((t) => t.state === "running")} label="进行中" cls="info" />
         <Stat n={count((t) => t.state === "blocked" || t.state === "waiting")} label="需要你" cls="warn" />
         <Stat n={count((t) => t.state === "queued")} label="排队" cls="off" />
-      </div>
+      </button>
       <button className="primary wide" onClick={p.onNew}>
         + 新任务
       </button>
@@ -145,10 +168,10 @@ function Sidebar(p: {
 
 function Stat({ n, label, cls }: { n: number; label: string; cls: string }) {
   return (
-    <div className={`stat ${cls}`}>
+    <span className={`stat ${cls}`}>
       <b>{n}</b>
       <span>{label}</span>
-    </div>
+    </span>
   );
 }
 
@@ -191,16 +214,19 @@ function useNotifications(state: State | null, open: (agentId: string) => void) 
     for (const t of state.tasks ?? []) {
       const was = prev.get(`t:${t.id}`);
       if (was === t.state) continue;
-      if (t.state === "done") notify(`完成: ${t.title}`, t.summary || "", () => t.agent_id && open(t.agent_id));
-      if (t.state === "failed") notify(`失败: ${t.title}`, t.error || t.detail || "", () => t.agent_id && open(t.agent_id));
-      if (t.state === "waiting") notify(`等你回复: ${t.title}`, t.summary || t.detail || "", () => t.agent_id && open(t.agent_id));
+      const show = () => {
+        if (t.agent_id) open(t.agent_id);
+      };
+      if (t.state === "done") notify(`完成: ${t.title}`, t.summary || "", show);
+      if (t.state === "failed") notify(`失败: ${t.title}`, t.error || t.detail || "", show);
+      if (t.state === "waiting") notify(`等你回复: ${t.title}`, t.summary || t.detail || "", show);
     }
   }, [state, open]);
 }
 
 function notify(title: string, body: string, onClick: () => void) {
   if (typeof Notification === "undefined") return;
-  const n = new Notification(title, { body: body.slice(0, 200), silent: false });
+  const n = new Notification(title, { body: body.slice(0, NOTIFY_BODY_MAX), silent: false });
   n.onclick = () => {
     window.focus();
     onClick();

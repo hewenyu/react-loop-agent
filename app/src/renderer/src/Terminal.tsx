@@ -3,6 +3,13 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { wsURL } from "./api";
+import {
+  TERM_CLOSE_EXITED,
+  TERM_CLOSE_RESYNC,
+  TERM_RESIZE_DEBOUNCE_MS,
+  TERM_RETRY_MS,
+  TERM_SCROLLBACK,
+} from "./constants";
 
 const theme = {
   background: "#141311",
@@ -15,9 +22,13 @@ const theme = {
 
 // Terminal shows an agent's terminal and types into it. It replays what
 // the agent printed so far, then follows it live; keys go to the agent as
-// if typed in its own terminal.
-export function Terminal({ agentId }: { agentId: string }) {
+// if typed in its own terminal. An agent that ended and is resumed keeps
+// its id, so when live turns true again the terminal reattaches.
+export function Terminal({ agentId, live }: { agentId: string; live: boolean }) {
   const host = useRef<HTMLDivElement>(null);
+  // reattach opens the stream again if it is not open; set by the effect
+  // that owns the terminal.
+  const reattach = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     const el = host.current;
@@ -28,7 +39,7 @@ export function Terminal({ agentId }: { agentId: string }) {
       fontSize: 13,
       lineHeight: 1.15,
       cursorBlink: true,
-      scrollback: 20000,
+      scrollback: TERM_SCROLLBACK,
       allowProposedApi: true,
       theme,
     });
@@ -47,26 +58,46 @@ export function Terminal({ agentId }: { agentId: string }) {
       }
     };
 
+    const retry = () => {
+      clearTimeout(timer);
+      timer = setTimeout(open, TERM_RETRY_MS);
+    };
+
     const open = () => {
+      if (closed) return;
+      clearTimeout(timer);
+      let sock: WebSocket;
+      try {
+        sock = new WebSocket(wsURL(`/api/agents/${encodeURIComponent(agentId)}/term`));
+      } catch {
+        // Not connected to the daemon yet.
+        retry();
+        return;
+      }
       term.reset();
-      ws = new WebSocket(wsURL(`/api/agents/${agentId}/term`));
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => {
+      ws = sock;
+      sock.binaryType = "arraybuffer";
+      sock.onopen = () => {
         fit.fit();
         sendSize();
       };
-      ws.onmessage = (e) => {
+      sock.onmessage = (e) => {
         if (e.data instanceof ArrayBuffer) term.write(new Uint8Array(e.data));
       };
-      ws.onclose = (e) => {
+      sock.onclose = (e) => {
+        if (ws === sock) ws = null;
         if (closed) return;
-        if (e.code === 4000) {
+        if (e.code === TERM_CLOSE_RESYNC) {
           // Fell behind: replay from the start.
           open();
-        } else if (e.reason !== "exited") {
-          timer = setTimeout(open, 1500);
+        } else if (e.reason !== TERM_CLOSE_EXITED) {
+          retry();
         }
       };
+    };
+
+    reattach.current = () => {
+      if (!ws) open();
     };
 
     const input = term.onData((d) => {
@@ -85,7 +116,7 @@ export function Terminal({ agentId }: { agentId: string }) {
         if (el.clientWidth === 0) return;
         fit.fit();
         sendSize();
-      }, 60);
+      }, TERM_RESIZE_DEBOUNCE_MS);
     });
     observer.observe(el);
 
@@ -95,6 +126,7 @@ export function Terminal({ agentId }: { agentId: string }) {
 
     return () => {
       closed = true;
+      reattach.current = null;
       clearTimeout(timer);
       clearTimeout(resizeTimer);
       observer.disconnect();
@@ -104,6 +136,11 @@ export function Terminal({ agentId }: { agentId: string }) {
       term.dispose();
     };
   }, [agentId]);
+
+  // The stream ends with the program; a resumed agent needs it again.
+  useEffect(() => {
+    if (live) reattach.current?.();
+  }, [live]);
 
   return <div className="term" ref={host} />;
 }

@@ -293,6 +293,8 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 6px;
+  padding: 0;
+  text-align: inherit;
   cursor: pointer;
 }
 

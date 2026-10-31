@@ -14,6 +14,17 @@ import (
 	"github.com/hewenyu/react-loop-agent/internal/sched"
 )
 
+// Files in the daemon's folder.
+const (
+	ConfigFile = "config.json"
+	StateFile  = "state.json"
+	DaemonFile = "daemon.json"
+	LockFile   = "daemon.lock"
+)
+
+// HomeEnv overrides the daemon's folder.
+const HomeEnv = "RLA_HOME"
+
 // State is everything the daemon keeps across restarts.
 type State struct {
 	Repos  []sched.Repo `json:"repos"`
@@ -42,13 +53,22 @@ type Config struct {
 	ClaudeBot string `json:"claude_bot"`
 }
 
-// LoadConfig reads config.json; none is the defaults.
+// LoadConfig reads config.json; none, or a field left empty, is the
+// default.
 func LoadConfig(home string) (Config, error) {
-	cfg := Config{Agent: "claude", ClaudeBot: "claude-bot"}
+	var cfg Config
 
-	err := readJSON(filepath.Join(home, "config.json"), &cfg)
+	err := readJSON(filepath.Join(home, ConfigFile), &cfg)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return cfg, err
+		return Config{}, err
+	}
+
+	if cfg.Agent == "" {
+		cfg.Agent = agent.DefaultProgram
+	}
+
+	if cfg.ClaudeBot == "" {
+		cfg.ClaudeBot = sched.DefaultBotProgram
 	}
 
 	return cfg, nil
@@ -56,8 +76,8 @@ func LoadConfig(home string) (Config, error) {
 
 // Home is the daemon's folder: $RLA_HOME, else ~/.rla.
 func Home() (string, error) {
-	if h := os.Getenv("RLA_HOME"); h != "" {
-		return h, nil
+	if h := os.Getenv(HomeEnv); h != "" {
+		return filepath.Abs(h)
 	}
 
 	home, err := os.UserHomeDir()
@@ -72,7 +92,7 @@ func Home() (string, error) {
 func Load(home string) (State, error) {
 	var st State
 
-	err := readJSON(filepath.Join(home, "state.json"), &st)
+	err := readJSON(filepath.Join(home, StateFile), &st)
 	if errors.Is(err, fs.ErrNotExist) {
 		return State{}, nil
 	}
@@ -82,14 +102,14 @@ func Load(home string) (State, error) {
 
 // Save writes the state.
 func Save(home string, st State) error {
-	return writeJSON(filepath.Join(home, "state.json"), st)
+	return writeJSON(filepath.Join(home, StateFile), st)
 }
 
 // ReadDaemon reads how to reach the daemon.
 func ReadDaemon(home string) (Daemon, error) {
 	var d Daemon
 
-	err := readJSON(filepath.Join(home, "daemon.json"), &d)
+	err := readJSON(filepath.Join(home, DaemonFile), &d)
 
 	return d, err
 }
@@ -97,12 +117,12 @@ func ReadDaemon(home string) (Daemon, error) {
 // WriteDaemon records how to reach the daemon. Only the user can read it:
 // the token lets anyone drive the agents.
 func WriteDaemon(home string, d Daemon) error {
-	return writeJSON(filepath.Join(home, "daemon.json"), d)
+	return writeJSON(filepath.Join(home, DaemonFile), d)
 }
 
 // RemoveDaemon removes the record when the daemon stops.
 func RemoveDaemon(home string) {
-	_ = os.Remove(filepath.Join(home, "daemon.json"))
+	_ = os.Remove(filepath.Join(home, DaemonFile))
 }
 
 func readJSON(path string, v any) error {
@@ -129,6 +149,7 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 
+	// CreateTemp makes the file readable by the user alone.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
@@ -149,10 +170,6 @@ func writeJSON(path string, v any) error {
 	}
 
 	if err := tmp.Close(); err != nil {
-		return err
-	}
-
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return err
 	}
 

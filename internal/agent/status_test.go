@@ -155,3 +155,24 @@ func TestStartupDialogWaitsForTheSession(t *testing.T) {
 	s.settle(at(9))
 	expect(t, &s, Blocked, "启动时需要确认: 信任这个目录")
 }
+
+func TestSplitGlyph(t *testing.T) {
+	tests := []struct {
+		in, rest string
+		glyph    rune
+	}{
+		{"✳ Claude Code", "Claude Code", '✳'},
+		{"◐ Fix tests", "Fix tests", '◐'},
+		{"Claude Code", "Claude Code", 0},
+		{"✳", "✳", 0},
+		{"", "", 0},
+		{"\xff x", "\xff x", 0},
+	}
+
+	for _, tt := range tests {
+		glyph, rest := splitGlyph(tt.in)
+		if glyph != tt.glyph || rest != tt.rest {
+			t.Errorf("splitGlyph(%q) = %q, %q; want %q, %q", tt.in, glyph, rest, tt.glyph, tt.rest)
+		}
+	}
+}

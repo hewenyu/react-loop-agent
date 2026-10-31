@@ -4,12 +4,14 @@
 package sched
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,13 +57,53 @@ const (
 	ReportNeedInput = "need-input"
 )
 
-// maxAttempts bounds how often a task is resumed by itself after its agent
-// was lost.
-const maxAttempts = 3
+// ErrNotFound reports an unknown task or repo.
+var ErrNotFound = errors.New("not found")
 
-// retryAfter is how long a task whose start failed waits before the next
-// try.
-const retryAfter = 30 * time.Second
+const (
+	// maxAttempts bounds how often a task is resumed by itself after its
+	// agent was lost.
+	maxAttempts = 3
+	// retryAfter is how long a task whose start failed waits before the
+	// next try.
+	retryAfter = 30 * time.Second
+	// stopWait is how long a start waits for the task's stopped agent to
+	// end before resuming it.
+	stopWait = 10 * time.Second
+	// defaultPoll is how often claude-bot inboxes are read.
+	defaultPoll = 3 * time.Second
+	// DefaultReport is the command agents run to report.
+	DefaultReport = "rla report"
+	// maxLog is how many log lines a task keeps.
+	maxLog = 100
+)
+
+// Text limits, in runes.
+const (
+	titleMax      = 60
+	botTitleMax   = 80
+	summaryMax    = 2000
+	lastMsgMax    = 500
+	logSummaryMax = 200
+)
+
+// Details shown with a task.
+const (
+	detailStarting   = "启动中"
+	detailResuming   = "daemon 重启，恢复会话"
+	detailNews       = "有新消息"
+	detailNeedInput  = "等你回答"
+	detailNoReport   = "回合结束，没有报告结果"
+	detailStartRetry = "启动失败，稍后重试"
+	detailRetry      = "重试"
+	detailCancelled  = "手动取消"
+	detailFinished   = "手动标记完成"
+
+	detailAgentGone    = "agent 不见了: "
+	detailExited       = "agent 退出了，没有报告完成"
+	detailReportFailed = "agent 报告失败"
+	detailBotClosed    = "claude-bot 里已经处理完"
+)
 
 // Repo is a folder the scheduler runs tasks in.
 type Repo struct {
@@ -154,11 +196,11 @@ type Scheduler struct {
 // New returns a scheduler that picks up where saved left off.
 func New(o Options, saved Saved) *Scheduler {
 	if o.Poll <= 0 {
-		o.Poll = 3 * time.Second
+		o.Poll = defaultPoll
 	}
 
 	if o.Report == "" {
-		o.Report = "rla report"
+		o.Report = DefaultReport
 	}
 
 	s := &Scheduler{o: o, kick: make(chan struct{}, 1), repos: map[string]*Repo{}, tasks: map[string]*Task{}}
@@ -168,6 +210,11 @@ func New(o Options, saved Saved) *Scheduler {
 	}
 
 	for _, t := range saved.Tasks {
+		if t.State.Active() && t.AgentID == "" {
+			// The daemon stopped while it was starting: nothing runs it.
+			t.State, t.Detail = Queued, detailResuming
+		}
+
 		s.tasks[t.ID] = &t
 	}
 
@@ -191,8 +238,8 @@ func (s *Scheduler) Saved() Saved {
 		out.Tasks = append(out.Tasks, c)
 	}
 
-	slices.SortFunc(out.Repos, func(a, b Repo) int { return cmpString(a.Path, b.Path) })
-	slices.SortFunc(out.Tasks, func(a, b Task) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	slices.SortFunc(out.Repos, func(a, b Repo) int { return strings.Compare(a.Path, b.Path) })
+	slices.SortFunc(out.Tasks, func(a, b Task) int { return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), strings.Compare(a.ID, b.ID)) })
 
 	return out
 }
@@ -266,7 +313,7 @@ func (s *Scheduler) follow(t *Task) bool {
 
 	info, err := s.o.Agents.AgentInfo(t.AgentID)
 	if err != nil {
-		return s.finish(t, Failed, "agent 不见了: "+err.Error())
+		return s.finish(t, Failed, detailAgentGone+err.Error())
 	}
 
 	switch info.Status {
@@ -287,13 +334,13 @@ func (s *Scheduler) follow(t *Task) bool {
 
 		if info.Status == agent.Lost && t.Attempts < maxAttempts {
 			// The daemon restarted under it: resume where it was.
-			t.State, t.Detail, t.NextTry, t.UpdatedAt = Queued, "daemon 重启，恢复会话", time.Time{}, time.Now()
+			t.State, t.Detail, t.NextTry, t.UpdatedAt = Queued, detailResuming, time.Time{}, time.Now()
 			s.logf(t, "agent 随 daemon 中断，重新排队恢复")
 
 			return true
 		}
 
-		return s.finish(t, Failed, "agent 退出了，没有报告完成")
+		return s.finish(t, Failed, detailExited)
 	}
 
 	return false
@@ -302,14 +349,14 @@ func (s *Scheduler) follow(t *Task) bool {
 // turnEnded decides what an agent's finished turn means for its task.
 func (s *Scheduler) turnEnded(t *Task, info agent.Info) bool {
 	if t.Summary == "" || t.Report == "" {
-		t.Summary = clip(info.LastMessage, 500)
+		t.Summary = clip(info.LastMessage, lastMsgMax)
 	}
 
 	switch {
 	case t.FollowUp:
 		// News came while it worked: give it to the same agent, idle now.
 		t.FollowUp = false
-		t.State, t.Detail, t.Report, t.NextTry = Queued, "有新消息", "", time.Time{}
+		t.State, t.Detail, t.Report, t.NextTry = Queued, detailNews, "", time.Time{}
 		s.logf(t, "回合结束，接着处理新消息")
 
 		return true
@@ -320,16 +367,16 @@ func (s *Scheduler) turnEnded(t *Task, info agent.Info) bool {
 	case t.Report == ReportFailed:
 		s.stopAgent(t)
 
-		return s.finish(t, Failed, "agent 报告失败")
+		return s.finish(t, Failed, detailReportFailed)
 	case t.Source == SourceClaudeBot && s.o.Bot.Done(t.Cwd, t.External):
 		// It replied, which closed the task, but did not report.
 		s.stopAgent(t)
 
 		return s.finish(t, Done, "")
 	case t.Report == ReportNeedInput:
-		return s.set(t, Waiting, "等你回答")
+		return s.set(t, Waiting, detailNeedInput)
 	default:
-		return s.set(t, Waiting, "回合结束，没有报告结果")
+		return s.set(t, Waiting, detailNoReport)
 	}
 }
 
@@ -402,7 +449,7 @@ func (s *Scheduler) startable() []*Task {
 		}
 
 		busy[t.Cwd]++
-		t.State, t.Detail, t.UpdatedAt = Running, "启动中", now
+		t.State, t.Detail, t.UpdatedAt = Running, detailStarting, now
 		starts = append(starts, t)
 	}
 
@@ -423,6 +470,19 @@ func (s *Scheduler) start(t *Task) {
 		info, err = s.run(c, prompt)
 		if err == nil {
 			s.mu.Lock()
+
+			if t.State != Running {
+				// Cancelled or finished while it started: the agent has
+				// nothing to do.
+				t.AgentID, t.Stopped = info.ID, true
+				s.logf(t, "启动时任务已是 %s，结束 agent %s", t.State, info.ID)
+				s.mu.Unlock()
+
+				go func() { _ = s.o.Agents.KillAgent(info.ID) }()
+
+				return
+			}
+
 			now := time.Now()
 			t.AgentID, t.TurnBase, t.Report, t.Error, t.FollowUp, t.Stopped = info.ID, info.Turns, "", "", false, false
 			t.Attempts++
@@ -442,13 +502,18 @@ func (s *Scheduler) start(t *Task) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if t.State != Running {
+		// Cancelled or finished while it started.
+		return
+	}
+
 	if errors.Is(err, ErrNotPending) {
-		s.finish(t, Done, "claude-bot 里已经处理完")
+		s.finish(t, Done, detailBotClosed)
 
 		return
 	}
 
-	t.State, t.Detail, t.Error = Queued, "启动失败，稍后重试", err.Error()
+	t.State, t.Detail, t.Error = Queued, detailStartRetry, err.Error()
 	t.NextTry = time.Now().Add(retryAfter)
 	s.logf(t, "启动失败: %v", err)
 }
@@ -458,7 +523,7 @@ func (s *Scheduler) start(t *Task) {
 func (s *Scheduler) run(t Task, prompt string) (agent.Info, error) {
 	if t.AgentID != "" {
 		if t.Stopped {
-			s.o.Agents.WaitAgent(t.AgentID, 10*time.Second)
+			s.o.Agents.WaitAgent(t.AgentID, stopWait)
 		}
 
 		info, err := s.o.Agents.AgentInfo(t.AgentID)
@@ -600,7 +665,7 @@ func (s *Scheduler) botTask(repo string, bt BotTask) {
 	default:
 		// Waiting, done or failed: give the news to the same agent,
 		// resumed if it ended, so it keeps the conversation.
-		t.State, t.Detail, t.Report, t.NextTry, t.UpdatedAt = Queued, "有新消息", "", time.Time{}, time.Now()
+		t.State, t.Detail, t.Report, t.NextTry, t.UpdatedAt = Queued, detailNews, "", time.Time{}, time.Now()
 		s.logf(t, "有新消息，重新排队")
 	}
 
@@ -616,7 +681,7 @@ type NewTask struct {
 
 // Add queues a task.
 func (s *Scheduler) Add(n NewTask) (Task, error) {
-	if n.Prompt == "" {
+	if strings.TrimSpace(n.Prompt) == "" {
 		return Task{}, errors.New("prompt is empty")
 	}
 
@@ -625,8 +690,9 @@ func (s *Scheduler) Add(n NewTask) (Task, error) {
 		return Task{}, fmt.Errorf("bad folder %q", n.Cwd)
 	}
 
+	n.Title = strings.TrimSpace(n.Title)
 	if n.Title == "" {
-		n.Title = clip(firstLine(n.Prompt), 60)
+		n.Title = clip(firstLine(strings.TrimSpace(n.Prompt)), titleMax)
 	}
 
 	s.mu.Lock()
@@ -642,7 +708,12 @@ func (s *Scheduler) Add(n NewTask) (Task, error) {
 
 func (s *Scheduler) add(t Task) *Task {
 	now := time.Now()
+
 	t.ID = newTaskID(now)
+	for s.tasks[t.ID] != nil {
+		t.ID = newTaskID(now)
+	}
+
 	t.State, t.CreatedAt, t.UpdatedAt = Queued, now, now
 	s.logf(&t, "收到任务")
 	s.tasks[t.ID] = &t
@@ -652,8 +723,9 @@ func (s *Scheduler) add(t Task) *Task {
 }
 
 // Report records what an agent says about its task. The task moves on once
-// the agent's turn ends.
-func (s *Scheduler) Report(id, status, summary string) error {
+// the agent's turn ends. from is the reporting agent, if known: an agent
+// may only report on its own task.
+func (s *Scheduler) Report(id, from, status, summary string) error {
 	switch status {
 	case ReportDone, ReportFailed, ReportNeedInput:
 	default:
@@ -663,14 +735,25 @@ func (s *Scheduler) Report(id, status, summary string) error {
 	s.mu.Lock()
 
 	t, ok := s.tasks[id]
-	if !ok {
+
+	switch {
+	case !ok:
 		s.mu.Unlock()
 
-		return fmt.Errorf("no task %s", id)
+		return fmt.Errorf("%w: task %s", ErrNotFound, id)
+	case from != "" && t.AgentID != from:
+		s.mu.Unlock()
+
+		return fmt.Errorf("task %s is not given to agent %s", id, from)
+	case t.State.Final():
+		s.mu.Unlock()
+
+		return fmt.Errorf("task is %s", t.State)
 	}
 
-	t.Report, t.Summary, t.UpdatedAt = status, clip(summary, 2000), time.Now()
-	s.logf(t, "agent 报告 %s: %s", status, clip(summary, 200))
+	summary = strings.TrimSpace(summary)
+	t.Report, t.Summary, t.UpdatedAt = status, clip(summary, summaryMax), time.Now()
+	s.logf(t, "agent 报告 %s: %s", status, clip(summary, logSummaryMax))
 	s.mu.Unlock()
 
 	s.changed()
@@ -686,11 +769,13 @@ func (s *Scheduler) Cancel(id string) error {
 			return fmt.Errorf("task is %s", t.State)
 		}
 
-		if t.State.Active() && t.AgentID != "" {
+		if t.AgentID != "" {
+			// Also a queued task's: its agent may be idle, waiting for
+			// the next message.
 			s.stopAgent(t)
 		}
 
-		s.finish(t, Cancelled, "手动取消")
+		s.finish(t, Cancelled, detailCancelled)
 
 		return nil
 	})
@@ -706,7 +791,7 @@ func (s *Scheduler) Retry(id string) error {
 
 		// A waiting task's agent is alive and idle: it gets the message
 		// itself. An ended one resumes.
-		t.State, t.Detail, t.Report, t.Error, t.NextTry, t.FinishedAt = Queued, "重试", "", "", time.Time{}, nil
+		t.State, t.Detail, t.Report, t.Error, t.NextTry, t.FinishedAt = Queued, detailRetry, "", "", time.Time{}, nil
 		s.logf(t, "重试")
 
 		return nil
@@ -720,11 +805,11 @@ func (s *Scheduler) Finish(id string) error {
 			return fmt.Errorf("task is %s", t.State)
 		}
 
-		if t.State.Active() && t.AgentID != "" {
+		if t.AgentID != "" {
 			s.stopAgent(t)
 		}
 
-		s.finish(t, Done, "手动标记完成")
+		s.finish(t, Done, detailFinished)
 
 		return nil
 	})
@@ -740,7 +825,7 @@ func (s *Scheduler) Remove(id string) error {
 	case !ok:
 		s.mu.Unlock()
 
-		return fmt.Errorf("no task %s", id)
+		return fmt.Errorf("%w: task %s", ErrNotFound, id)
 	case !t.State.Final():
 		s.mu.Unlock()
 
@@ -762,7 +847,7 @@ func (s *Scheduler) update(id string, f func(t *Task) error) error {
 	if !ok {
 		s.mu.Unlock()
 
-		return fmt.Errorf("no task %s", id)
+		return fmt.Errorf("%w: task %s", ErrNotFound, id)
 	}
 
 	err := f(t)
@@ -806,7 +891,7 @@ func (s *Scheduler) RemoveRepo(path string) error {
 	if _, ok := s.repos[path]; !ok {
 		s.mu.Unlock()
 
-		return fmt.Errorf("no repo %s", path)
+		return fmt.Errorf("%w: repo %s", ErrNotFound, path)
 	}
 
 	delete(s.repos, path)
@@ -823,14 +908,14 @@ func (s *Scheduler) sorted() []*Task {
 		tasks = append(tasks, t)
 	}
 
-	slices.SortFunc(tasks, func(a, b *Task) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	slices.SortFunc(tasks, func(a, b *Task) int { return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), strings.Compare(a.ID, b.ID)) })
 
 	return tasks
 }
 
 func (s *Scheduler) logf(t *Task, format string, args ...any) {
 	t.Log = append(t.Log, LogLine{At: time.Now(), Text: fmt.Sprintf(format, args...)})
-	if over := len(t.Log) - 100; over > 0 {
+	if over := len(t.Log) - maxLog; over > 0 {
 		t.Log = t.Log[over:]
 	}
 }
@@ -849,17 +934,8 @@ func (s *Scheduler) changedLater() {
 
 var taskSeq atomic.Int64
 
+// newTaskID is unique within a daemon: the time keeps ids apart across
+// restarts, the sequence within one millisecond.
 func newTaskID(now time.Time) string {
-	return "t" + strconv.FormatInt(now.UnixMilli(), 36) + strconv.FormatInt(taskSeq.Add(1)%36, 36)
-}
-
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-
-	return 0
+	return "t" + strconv.FormatInt(now.UnixMilli(), 36) + strconv.FormatInt(taskSeq.Add(1), 36)
 }

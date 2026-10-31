@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,22 @@ import (
 
 	"github.com/hewenyu/react-loop-agent/internal/agent"
 	"github.com/hewenyu/react-loop-agent/internal/sched"
+)
+
+const (
+	// maxBody bounds a request body.
+	maxBody = 4 << 20
+	// maxTermMessage bounds one message a terminal viewer sends.
+	maxTermMessage = 1 << 20
+	// changeDelay gathers a burst of changes into one push.
+	changeDelay = 100 * time.Millisecond
+	// pingEvery keeps an idle WebSocket open and finds dead ones.
+	pingEvery = 20 * time.Second
+	// StatusResync closes a terminal stream whose viewer fell behind: it
+	// reconnects and replays.
+	StatusResync websocket.StatusCode = 4000
+	// HeaderAgent names the agent a request comes from.
+	HeaderAgent = "X-RLA-Agent"
 )
 
 // State is everything the app shows.
@@ -61,7 +79,7 @@ func (s *Server) Changed() {
 
 	s.pending = true
 
-	time.AfterFunc(100*time.Millisecond, func() {
+	time.AfterFunc(changeDelay, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
@@ -154,7 +172,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer c.CloseNow()
+	defer func() { _ = c.CloseNow() }()
 
 	ch := make(chan struct{}, 1)
 
@@ -172,7 +190,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	ctx := c.CloseRead(r.Context())
-	ping := time.NewTicker(20 * time.Second)
+	ping := time.NewTicker(pingEvery)
 
 	defer ping.Stop()
 
@@ -205,6 +223,12 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 func (s *Server) addTask(w http.ResponseWriter, r *http.Request) {
 	var n sched.NewTask
 	if !decode(w, r, &n) {
+		return
+	}
+
+	if err := checkDir(n.Cwd); err != nil {
+		fail(w, http.StatusBadRequest, err)
+
 		return
 	}
 
@@ -254,12 +278,18 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	done(w, s.Sched.Report(b.Task, b.Status, b.Summary))
+	done(w, s.Sched.Report(b.Task, r.Header.Get(HeaderAgent), b.Status, b.Summary))
 }
 
 func (s *Server) setRepo(w http.ResponseWriter, r *http.Request) {
 	var repo sched.Repo
 	if !decode(w, r, &repo) {
+		return
+	}
+
+	if err := checkDir(repo.Path); err != nil {
+		fail(w, http.StatusBadRequest, err)
+
 		return
 	}
 
@@ -307,7 +337,7 @@ func (s *Server) agentAction(w http.ResponseWriter, r *http.Request) {
 		Force bool   `json:"force"`
 	}
 
-	if r.ContentLength > 0 && !decode(w, r, &b) {
+	if !decodeOptional(w, r, &b) {
 		return
 	}
 
@@ -353,9 +383,9 @@ func (s *Server) term(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer c.CloseNow()
+	defer func() { _ = c.CloseNow() }()
 
-	c.SetReadLimit(1 << 20)
+	c.SetReadLimit(maxTermMessage)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -377,7 +407,7 @@ func (s *Server) term(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				if a.Info().Status.Live() {
 					// Fell behind: the viewer reconnects and replays.
-					_ = c.Close(4000, "resync")
+					_ = c.Close(StatusResync, "resync")
 				} else {
 					_ = c.Close(websocket.StatusNormalClosure, "exited")
 				}
@@ -432,12 +462,20 @@ func (s *Server) screen(w http.ResponseWriter, r *http.Request) {
 	detach()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	_, _ = w.Write(replay)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(replay) //nolint:gosec // raw terminal bytes, sent as octet-stream, never rendered as HTML
 }
 
 // hook takes a hook event from an agent's `rla hook`.
 func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	id := r.Header.Get(HeaderAgent)
+	if id == "" {
+		fail(w, http.StatusBadRequest, errors.New("no agent: "+HeaderAgent+" is not set"))
+
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		fail(w, http.StatusBadRequest, err)
 
@@ -451,7 +489,6 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.Header.Get("X-RLA-Agent")
 	if err := s.Agents.Hook(id, h); err != nil {
 		fail(w, http.StatusNotFound, err)
 
@@ -466,13 +503,38 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(v); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(v); err != nil {
 		fail(w, http.StatusBadRequest, fmt.Errorf("bad request body: %w", err))
 
 		return false
 	}
 
 	return true
+}
+
+// decodeOptional is decode for a body that may be left out.
+func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody)).Decode(v)
+	if err != nil && !errors.Is(err, io.EOF) {
+		fail(w, http.StatusBadRequest, fmt.Errorf("bad request body: %w", err))
+
+		return false
+	}
+
+	return true
+}
+
+// checkDir reports whether dir is a folder agents can work in.
+func checkDir(dir string) error {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return fmt.Errorf("folder must be an absolute path: %q", dir)
+	}
+
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return fmt.Errorf("no such folder: %s", dir)
+	}
+
+	return nil
 }
 
 func reply(w http.ResponseWriter, v any) {
@@ -483,7 +545,7 @@ func reply(w http.ResponseWriter, v any) {
 func done(w http.ResponseWriter, err error) {
 	if err != nil {
 		code := http.StatusConflict
-		if errors.Is(err, agent.ErrNotFound) {
+		if errors.Is(err, agent.ErrNotFound) || errors.Is(err, sched.ErrNotFound) {
 			code = http.StatusNotFound
 		}
 

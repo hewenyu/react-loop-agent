@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -232,7 +233,7 @@ func TestManualTaskRunsToDone(t *testing.T) {
 	}
 
 	fa.set("a1", agent.Working, 0, "")
-	_ = s.Report(tk.ID, ReportDone, "fixed in #12")
+	_ = s.Report(tk.ID, "", ReportDone, "fixed in #12")
 	s.Step()
 	expectState(t, s, tk.ID, Running) // done once the turn ends
 
@@ -439,7 +440,7 @@ func TestRetryRightAfterDoneWaitsForTheAgentToEnd(t *testing.T) {
 	tk, _ := s.Add(NewTask{Prompt: "do it", Cwd: "/repo"})
 	s.Step()
 
-	_ = s.Report(tk.ID, ReportDone, "ok")
+	_ = s.Report(tk.ID, "", ReportDone, "ok")
 	fa.set("a1", agent.Idle, 1, "")
 	s.Step()
 	expectState(t, s, tk.ID, Done)
@@ -451,4 +452,126 @@ func TestRetryRightAfterDoneWaitsForTheAgentToEnd(t *testing.T) {
 	s.Step()
 	fa.lastCall(t, "resume a1: ")
 	expectState(t, s, tk.ID, Running)
+}
+
+func TestCancelWhileStartingEndsTheNewAgent(t *testing.T) {
+	s, fa, _ := newTest(t)
+	tk, _ := s.Add(NewTask{Prompt: "do it", Cwd: "/repo"})
+
+	s.mu.Lock()
+	starts := s.startable()
+	s.mu.Unlock()
+
+	if len(starts) != 1 {
+		t.Fatalf("startable = %d tasks", len(starts))
+	}
+
+	if err := s.Cancel(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	s.start(starts[0])
+
+	fa.lastCall(t, "kill a1")
+
+	if got := expectState(t, s, tk.ID, Cancelled); got.AgentID != "a1" {
+		t.Fatalf("agent = %q", got.AgentID)
+	}
+}
+
+func TestCancelQueuedFollowUpStopsItsIdleAgent(t *testing.T) {
+	s, fa, _ := newTest(t)
+	tk, _ := s.Add(NewTask{Prompt: "do it", Cwd: "/repo"})
+
+	s.Step()
+	fa.set("a1", agent.Idle, 1, "")
+	s.Step()
+	expectState(t, s, tk.ID, Waiting)
+
+	// Queued again, held back so its agent stays idle and alive.
+	_ = s.Retry(tk.ID)
+	_ = s.update(tk.ID, func(t *Task) error { t.NextTry = time.Now().Add(time.Hour); return nil })
+
+	if err := s.Cancel(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	fa.lastCall(t, "kill a1")
+}
+
+func TestReportChecks(t *testing.T) {
+	s, _, _ := newTest(t)
+	tk, _ := s.Add(NewTask{Prompt: "do it", Cwd: "/repo"})
+	s.Step()
+
+	tests := []struct {
+		name, id, from, status string
+		wantErr                bool
+	}{
+		{"unknown task", "t-none", "", ReportDone, true},
+		{"unknown status", tk.ID, "", "maybe", true},
+		{"another agent's task", tk.ID, "a9", ReportDone, true},
+		{"its own agent", tk.ID, "a1", ReportNeedInput, false},
+		{"a person", tk.ID, "", ReportDone, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := s.Report(tt.id, tt.from, tt.status, "x")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	_ = s.Cancel(tk.ID)
+
+	if err := s.Report(tk.ID, "", ReportDone, "late"); err == nil {
+		t.Fatal("a report on a cancelled task was taken")
+	}
+
+	if err := s.Report("t-none", "", ReportDone, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTaskStartingWhenTheDaemonStoppedIsQueuedAgain(t *testing.T) {
+	saved := Saved{Tasks: []Task{{ID: "t1", Cwd: "/repo", Prompt: "p", State: Running, Detail: detailStarting}}}
+	s := New(Options{Agents: newFakeAgents(), Bot: &fakeBot{}}, saved)
+
+	expectState(t, s, "t1", Queued)
+}
+
+func TestTaskIDsAreUniqueInABurst(t *testing.T) {
+	s, _, _ := newTest(t)
+
+	const n = 200
+	for range n {
+		if _, err := s.Add(NewTask{Prompt: "p", Cwd: "/repo"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := len(s.Saved().Tasks); got != n {
+		t.Fatalf("%d tasks kept, want %d", got, n)
+	}
+}
+
+func TestAddRejectsBadInput(t *testing.T) {
+	s, _, _ := newTest(t)
+
+	for _, n := range []NewTask{{Prompt: "", Cwd: "/repo"}, {Prompt: "  \n ", Cwd: "/repo"}, {Prompt: "p", Cwd: ""}} {
+		if _, err := s.Add(n); err == nil {
+			t.Errorf("Add(%+v) took it", n)
+		}
+	}
+
+	tk, err := s.Add(NewTask{Prompt: "\n  first line\nsecond", Title: "  ", Cwd: "/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if tk.Title != "first line" {
+		t.Fatalf("title = %q", tk.Title)
+	}
 }

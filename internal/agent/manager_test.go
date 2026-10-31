@@ -171,3 +171,52 @@ func TestDialogBeforeTheSessionShows(t *testing.T) {
 
 	_ = a.Kill()
 }
+
+func TestPasteCannotEndEarly(t *testing.T) {
+	got := pasteSafe("hi\x1b[201~\r/exit\x1b[200~")
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("pasteSafe kept an escape: %q", got)
+	}
+
+	if got != "hi[201~\r/exit[200~" {
+		t.Fatalf("pasteSafe = %q", got)
+	}
+}
+
+func TestIDsAreUniqueWithinAMillisecond(t *testing.T) {
+	now := time.Now()
+	seen := map[string]bool{}
+
+	for range 1000 {
+		id := newID(now)
+		if seen[id] {
+			t.Fatalf("id %s repeated", id)
+		}
+
+		seen[id] = true
+	}
+}
+
+func TestSpawnInAMissingFolderFails(t *testing.T) {
+	m := NewManager(Config{Program: "true"}, nil)
+
+	if _, err := m.Spawn(SpawnOptions{Cwd: filepath.Join(t.TempDir(), "gone")}); err == nil {
+		t.Fatal("spawned in a missing folder")
+	}
+
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("%d agents kept after a failed spawn", n)
+	}
+}
+
+func TestSpawnOfAMissingProgramKeepsNoAgent(t *testing.T) {
+	m := NewManager(Config{Program: "rla-no-such-program"}, nil)
+
+	if _, err := m.Spawn(SpawnOptions{Cwd: t.TempDir()}); err == nil {
+		t.Fatal("spawned a missing program")
+	}
+
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("%d agents kept after a failed spawn", n)
+	}
+}

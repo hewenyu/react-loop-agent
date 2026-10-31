@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Status is what an agent is doing.
@@ -28,6 +29,38 @@ const (
 func (s Status) Live() bool {
 	return s == Starting || s == Working || s == Blocked || s == Idle
 }
+
+// Claude Code hook events.
+const (
+	EventSessionStart       = "SessionStart"
+	EventUserPromptSubmit   = "UserPromptSubmit"
+	EventPreToolUse         = "PreToolUse"
+	EventPostToolUse        = "PostToolUse"
+	EventPostToolUseFailure = "PostToolUseFailure"
+	EventPermissionRequest  = "PermissionRequest"
+	EventNotification       = "Notification"
+	EventStop               = "Stop"
+	EventSubagentStop       = "SubagentStop"
+	EventSessionEnd         = "SessionEnd"
+)
+
+// notifyPermission is the notification type of a permission prompt.
+const notifyPermission = "permission_prompt"
+
+// Details shown with a status.
+const (
+	detailPermission = "需要授权: "
+	detailStartup    = "启动时需要确认"
+	detailTrust      = detailStartup + ": 信任这个目录"
+	detailInterrupt  = "已中断"
+	detailDeclined   = "已拒绝"
+)
+
+// glyphIdle is the glyph Claude Code puts before its title when idle.
+const glyphIdle = '✳'
+
+// toolLineMax bounds the tool call shown as a detail, in runes.
+const toolLineMax = 120
 
 // settleDelay is how long a fallback waits for a hook before it trusts what
 // the screen says.
@@ -89,16 +122,16 @@ func (s *state) hook(h Hook, now time.Time) bool {
 	}
 
 	switch h.Event {
-	case "SessionStart":
+	case EventSessionStart:
 		if s.Status == Starting || s.Status == Blocked {
 			// A dialog before the session, if any, was answered.
 			s.Status, s.Detail = Idle, ""
 		}
-	case "UserPromptSubmit":
+	case EventUserPromptSubmit:
 		s.Status, s.Detail = Working, ""
-	case "PreToolUse":
+	case EventPreToolUse:
 		s.Status, s.Detail = Working, toolSummary(h)
-	case "PostToolUse", "PostToolUseFailure", "SubagentStop":
+	case EventPostToolUse, EventPostToolUseFailure, EventSubagentStop:
 		if s.Status == Blocked || s.Status == Idle || s.Status == Starting {
 			s.Status = Working
 		}
@@ -106,15 +139,15 @@ func (s *state) hook(h Hook, now time.Time) bool {
 		if s.Status == Working && h.SubagentID == "" {
 			s.Detail = ""
 		}
-	case "PermissionRequest":
-		s.Status, s.Detail = Blocked, "需要授权: "+toolSummary(h)
+	case EventPermissionRequest:
+		s.Status, s.Detail = Blocked, detailPermission+toolSummary(h)
 		s.inputAt = time.Time{}
-	case "Notification":
-		if h.NotificationType == "permission_prompt" && s.Status != Blocked {
+	case EventNotification:
+		if h.NotificationType == notifyPermission && s.Status != Blocked {
 			s.Status, s.Detail = Blocked, h.Message
 			s.inputAt = time.Time{}
 		}
-	case "Stop":
+	case EventStop:
 		s.Status, s.Detail = Idle, ""
 		s.Turns++
 		s.LastMessage = h.LastAssistantMessage
@@ -138,7 +171,7 @@ func (s *state) title(t string, now time.Time) bool {
 		if !s.hooked || s.Status == Blocked && s.inputAt.After(s.lastHook) {
 			s.Status, s.Detail = Working, ""
 		}
-	case glyph == '✳':
+	case glyph == glyphIdle:
 		s.spinning = false
 
 		if !s.hooked && (s.Status == Starting || s.Status == Working) {
@@ -188,9 +221,9 @@ func (s *state) output(p []byte) {
 		return
 	}
 
-	s.Status, s.Detail = Blocked, "启动时需要确认"
+	s.Status, s.Detail = Blocked, detailStartup
 	if strings.Contains(text, "trustthisfolder") {
-		s.Detail = "启动时需要确认: 信任这个目录"
+		s.Detail = detailTrust
 	}
 }
 
@@ -218,13 +251,13 @@ func (s *state) settle(now time.Time) bool {
 	case s.Status == Working && !s.spinning && !s.stillAt.IsZero() &&
 		s.stillAt.After(s.lastHook) && now.Sub(s.stillAt) >= settleDelay:
 		// Esc ends a turn without a Stop hook.
-		s.Status, s.Detail = Idle, "已中断"
+		s.Status, s.Detail = Idle, detailInterrupt
 		s.stillAt = time.Time{}
 	case s.Status == Blocked && s.hooked && !s.inputAt.IsZero() && !s.promptSeen &&
 		s.inputAt.After(s.lastHook) && now.Sub(s.inputAt) >= settleDelay:
 		// Declining a permission prompt ends the turn without a hook. A
 		// dialog before the session ends with SessionStart or the exit.
-		s.Status, s.Detail = Idle, "已拒绝"
+		s.Status, s.Detail = Idle, detailDeclined
 		s.inputAt = time.Time{}
 	}
 
@@ -246,14 +279,13 @@ var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x
 
 // splitGlyph splits the status glyph Claude Code puts before its title.
 func splitGlyph(t string) (rune, string) {
-	for i, r := range t {
-		if i == 0 {
-			if rest, ok := strings.CutPrefix(t[len(string(r)):], " "); ok {
-				return r, rest
-			}
-		}
+	r, n := utf8.DecodeRuneInString(t)
+	if r == utf8.RuneError {
+		return 0, t
+	}
 
-		break
+	if rest, ok := strings.CutPrefix(t[n:], " "); ok {
+		return r, rest
 	}
 
 	return 0, t
@@ -271,7 +303,7 @@ func toolSummary(h Hook) string {
 
 	for _, k := range []string{"command", "file_path", "pattern", "url", "description", "prompt"} {
 		if v, ok := in[k].(string); ok && v != "" {
-			return h.ToolName + ": " + clip(firstLine(v), 120)
+			return h.ToolName + ": " + clip(firstLine(v), toolLineMax)
 		}
 	}
 

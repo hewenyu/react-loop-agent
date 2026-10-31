@@ -8,11 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/hewenyu/react-loop-agent/internal/agent"
+	"github.com/hewenyu/react-loop-agent/internal/api"
 	"github.com/hewenyu/react-loop-agent/internal/store"
+)
+
+// timeout bounds one request to the daemon.
+const timeout = 30 * time.Second
+
+// How an agent reaches the daemon that started it.
+const (
+	EnvAddr  = "RLA_ADDR"
+	EnvToken = "RLA_TOKEN"
 )
 
 // ErrNoDaemon reports that no daemon is running.
@@ -28,7 +40,7 @@ type Client struct {
 // New finds the daemon: $RLA_ADDR and $RLA_TOKEN inside an agent, else the
 // record the daemon wrote.
 func New() (*Client, error) {
-	addr, tok := os.Getenv("RLA_ADDR"), os.Getenv("RLA_TOKEN")
+	addr, tok := os.Getenv(EnvAddr), os.Getenv(EnvToken)
 
 	if addr == "" || tok == "" {
 		home, err := store.Home()
@@ -37,14 +49,16 @@ func New() (*Client, error) {
 		}
 
 		d, err := store.ReadDaemon(home)
-		if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, ErrNoDaemon
+		} else if err != nil {
+			return nil, err
 		}
 
 		addr, tok = d.Addr, d.Token
 	}
 
-	return &Client{Addr: addr, Token: tok, HTTP: &http.Client{Timeout: 30 * time.Second}}, nil
+	return &Client{Addr: addr, Token: tok, HTTP: &http.Client{Timeout: timeout}}, nil
 }
 
 // Do sends a request with a JSON body, if in is not nil, and decodes the
@@ -69,17 +83,20 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 	}
 
 	req.Header.Set("Authorization", "Bearer "+c.Token)
-	req.Header.Set("Content-Type", "application/json")
 
-	if id := os.Getenv("RLA_AGENT_ID"); id != "" {
-		req.Header.Set("X-RLA-Agent", id)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	if id := os.Getenv(agent.EnvAgentID); id != "" {
+		req.Header.Set(api.HeaderAgent, id)
 	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrNoDaemon, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {

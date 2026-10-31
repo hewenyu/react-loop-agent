@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,9 +23,29 @@ var (
 	ErrLive    = errors.New("agent is still running")
 )
 
-// pasteGap is the pause between pasting text and pressing Enter, so the
-// program sees a paste followed by a submit, not one long paste.
-const pasteGap = 150 * time.Millisecond
+const (
+	// pasteGap is the pause between pasting text and pressing Enter, so the
+	// program sees a paste followed by a submit, not one long paste.
+	pasteGap = 150 * time.Millisecond
+	// killGrace is how long a program gets to end after each signal.
+	killGrace = 3 * time.Second
+	// defaultRows and defaultCols size a terminal no viewer has sized yet.
+	defaultRows, defaultCols = 40, 120
+	// maxSize bounds the rows and columns a viewer may ask for.
+	maxSize = 1000
+	// readSize is how much terminal output is read at once.
+	readSize = 32 << 10
+	// viewerBuffer is how many reads a viewer may fall behind before it is
+	// dropped and has to replay.
+	viewerBuffer = 512
+)
+
+// Bracketed paste markers. Text pasted into the terminal must not carry
+// them: an end marker inside it would turn the rest into typed keys.
+const (
+	pasteStart = "\x1b[200~"
+	pasteEnd   = "\x1b[201~"
+)
 
 // Info is what the outside sees of an agent. It is also what the daemon
 // saves, so an agent can be resumed after a restart.
@@ -84,8 +105,8 @@ func (a *Agent) start(cmd *exec.Cmd) error {
 	}
 
 	rows, cols := a.info.Rows, a.info.Cols
-	if rows <= 0 || cols <= 0 {
-		rows, cols = 40, 120
+	if rows <= 0 || cols <= 0 || rows > maxSize || cols > maxSize {
+		rows, cols = defaultRows, defaultCols
 	}
 
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
@@ -112,7 +133,7 @@ func (a *Agent) start(cmd *exec.Cmd) error {
 // pump copies the terminal's output to the ring and the viewers until the
 // program ends.
 func (a *Agent) pump(cmd *exec.Cmd, f *os.File) {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, readSize)
 
 	for {
 		n, err := f.Read(buf)
@@ -153,10 +174,12 @@ func (a *Agent) pump(cmd *exec.Cmd, f *os.File) {
 }
 
 func (a *Agent) output(p []byte) {
-	_, _ = a.ring.Write(p)
-
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Under the lock, so a viewer attaching now gets p either in its
+	// replay or on its channel, never both.
+	_, _ = a.ring.Write(p)
 
 	now := time.Now()
 	before := a.st.shown()
@@ -247,7 +270,7 @@ func (a *Agent) Attach() (replay []byte, out <-chan []byte, detach func()) {
 	// Queries in the history were asked long ago; the viewer's terminal
 	// must not answer them again into the program.
 	replay = term.StripQueries(a.ring.Bytes())
-	ch := make(chan []byte, 512)
+	ch := make(chan []byte, viewerBuffer)
 
 	if a.pty == nil {
 		close(ch)
@@ -291,7 +314,7 @@ func (a *Agent) Write(p []byte) error {
 
 // Resize sets the terminal size.
 func (a *Agent) Resize(rows, cols int) error {
-	if rows <= 0 || cols <= 0 || rows > 1000 || cols > 1000 {
+	if rows <= 0 || cols <= 0 || rows > maxSize || cols > maxSize {
 		return fmt.Errorf("bad size %dx%d", cols, rows)
 	}
 
@@ -323,7 +346,7 @@ func (a *Agent) Send(text string, force bool) error {
 		return fmt.Errorf("%w: %s", ErrBusy, st)
 	}
 
-	if _, err := io.WriteString(f, "\x1b[200~"+text+"\x1b[201~"); err != nil {
+	if _, err := io.WriteString(f, pasteStart+pasteSafe(text)+pasteEnd); err != nil {
 		return err
 	}
 
@@ -332,6 +355,12 @@ func (a *Agent) Send(text string, force bool) error {
 	_, err := io.WriteString(f, "\r")
 
 	return err
+}
+
+// pasteSafe drops escape characters from text to paste: text from a chat or
+// an issue must not end the paste early and go on as keys.
+func pasteSafe(text string) string {
+	return strings.ReplaceAll(text, "\x1b", "")
 }
 
 // Interrupt stops the current turn, not the program.
@@ -349,7 +378,8 @@ func (a *Agent) Interrupt() error {
 	return err
 }
 
-// Kill ends the program: a hangup first, then a kill if it lingers.
+// Kill ends the program: a hangup first, then a kill if it lingers. It
+// gives up if even that does not end it, e.g. a child holding the terminal.
 func (a *Agent) Kill() error {
 	a.mu.Lock()
 	cmd, done := a.cmd, a.done
@@ -365,23 +395,27 @@ func (a *Agent) Kill() error {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		<-done
+		return nil
+	case <-time.After(killGrace):
 	}
 
-	return nil
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(killGrace):
+		return fmt.Errorf("agent %s did not exit", a.Info().ID)
+	}
 }
 
-// Wait returns once the program ends.
-func (a *Agent) Wait() {
+// Done returns a channel that closes when the program ends; nil if it
+// never started.
+func (a *Agent) Done() <-chan struct{} {
 	a.mu.Lock()
-	done := a.done
-	a.mu.Unlock()
+	defer a.mu.Unlock()
 
-	if done != nil {
-		<-done
-	}
+	return a.done
 }
 
 // note writes a line of the daemon's own into the terminal history, shown

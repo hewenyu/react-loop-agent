@@ -40,6 +40,15 @@ type BotSource interface {
 // ErrNotPending reports a task that was closed before it was taken.
 var ErrNotPending = errors.New("claude-bot task is not pending")
 
+const (
+	// DefaultBotProgram is the claude-bot command when none is configured.
+	DefaultBotProgram = "claude-bot"
+	// takeTimeout bounds one run of `claude-bot inbox`.
+	takeTimeout = 30 * time.Second
+	// maxInboxLine bounds one task line `claude-bot inbox` prints.
+	maxInboxLine = 64 << 20
+)
+
 // ClaudeBot reads the inbox files and runs the claude-bot command.
 type ClaudeBot struct {
 	// Program is the claude-bot command.
@@ -104,7 +113,7 @@ func (c ClaudeBot) Pending(repo string) ([]BotTask, error) {
 func botTitle(f botFile) string {
 	for i, e := range f.Entries {
 		if e.Kind == "user" && i >= f.Handled && strings.TrimSpace(e.Text) != "" {
-			return clip(firstLine(strings.TrimSpace(e.Text)), 80)
+			return clip(firstLine(strings.TrimSpace(e.Text)), botTitleMax)
 		}
 	}
 
@@ -113,7 +122,7 @@ func botTitle(f botFile) string {
 
 // Take runs `claude-bot inbox` in the repo and returns the task's line.
 func (c ClaudeBot) Take(repo, id string) (BotTask, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), takeTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, c.program(), "-C", repo, "inbox")
@@ -128,7 +137,7 @@ func (c ClaudeBot) Take(repo, id string) (BotTask, error) {
 	}
 
 	sc := bufio.NewScanner(bytes.NewReader(out))
-	sc.Buffer(nil, 64<<20)
+	sc.Buffer(nil, maxInboxLine)
 
 	for sc.Scan() {
 		var f botFile
@@ -158,7 +167,7 @@ func (c ClaudeBot) program() string {
 		return c.Program
 	}
 
-	return "claude-bot"
+	return DefaultBotProgram
 }
 
 func firstLine(s string) string {

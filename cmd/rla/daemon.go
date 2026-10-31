@@ -21,8 +21,20 @@ import (
 
 	"github.com/hewenyu/react-loop-agent/internal/agent"
 	"github.com/hewenyu/react-loop-agent/internal/api"
+	"github.com/hewenyu/react-loop-agent/internal/client"
 	"github.com/hewenyu/react-loop-agent/internal/sched"
 	"github.com/hewenyu/react-loop-agent/internal/store"
+)
+
+const (
+	// saveDelay gathers a burst of changes into one save.
+	saveDelay = 500 * time.Millisecond
+	// shutdownTimeout bounds how long open requests get when stopping.
+	shutdownTimeout = 3 * time.Second
+	// readHeaderTimeout bounds how long a client may take to send headers.
+	readHeaderTimeout = 10 * time.Second
+	// tokenBytes is the size of the API token, before hex.
+	tokenBytes = 24
 )
 
 // cmdDaemon runs the daemon: it owns the agents' terminals, schedules the
@@ -72,14 +84,18 @@ func cmdDaemon(args []string) error {
 		return err
 	}
 
-	self, _ = filepath.EvalSymlinks(self)
+	// Agents run the hook through this path; resolve a symlink so it keeps
+	// working if the link moves, but keep the path if it cannot be resolved.
+	if real, err := filepath.EvalSymlinks(self); err == nil {
+		self = real
+	}
 
 	saved, err := store.Load(home)
 	if err != nil {
 		return err
 	}
 
-	ln, err := net.Listen("tcp", *addr)
+	ln, err := new(net.ListenConfig).Listen(context.Background(), "tcp", *addr)
 	if err != nil {
 		return err
 	}
@@ -128,7 +144,7 @@ func cmdDaemon(args []string) error {
 		defer saveMu.Unlock()
 
 		if saveSoon == nil {
-			saveSoon = time.AfterFunc(500*time.Millisecond, func() {
+			saveSoon = time.AfterFunc(saveDelay, func() {
 				saveMu.Lock()
 				saveSoon = nil
 				saveMu.Unlock()
@@ -146,11 +162,11 @@ func cmdDaemon(args []string) error {
 		HookCommand: shellQuote(self) + " hook",
 		// Agents report with `rla report`, found on the PATH below; it
 		// only tells the daemon about their own task.
-		Allow: []string{"Bash(rla report:*)"},
+		Allow: []string{"Bash(" + sched.DefaultReport + ":*)"},
 		Env: map[string]string{
-			"RLA_ADDR":  ln.Addr().String(),
-			"RLA_TOKEN": token,
-			"PATH":      filepath.Dir(self),
+			client.EnvAddr:  ln.Addr().String(),
+			client.EnvToken: token,
+			"PATH":          filepath.Dir(self),
 		},
 	}, func(agent.Info) {
 		changed()
@@ -164,7 +180,7 @@ func cmdDaemon(args []string) error {
 	s = sched.New(sched.Options{
 		Agents:   m,
 		Bot:      sched.ClaudeBot{Program: *claudeBot},
-		Report:   "rla report",
+		Report:   sched.DefaultReport,
 		OnChange: changed,
 	}, sched.Saved{Repos: saved.Repos, Tasks: saved.Tasks})
 
@@ -175,7 +191,7 @@ func cmdDaemon(args []string) error {
 
 	srv.Shutdown = stop
 
-	httpSrv := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	httpSrv := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: readHeaderTimeout}
 
 	go func() {
 		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -198,10 +214,12 @@ func cmdDaemon(args []string) error {
 	<-ctx.Done()
 	log.Info("rla daemon stopping")
 
-	save()
+	// Stop saving first: agents ending with the daemon must stay saved
+	// as running, to come back lost and resume.
 	stopping.Store(true)
+	save()
 
-	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	_ = httpSrv.Shutdown(sctx)
@@ -213,7 +231,7 @@ func cmdDaemon(args []string) error {
 
 // lockDaemon makes sure one daemon runs per home.
 func lockDaemon(home string) (func(), error) {
-	f, err := os.OpenFile(filepath.Join(home, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(filepath.Join(home, store.LockFile), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +246,7 @@ func lockDaemon(home string) (func(), error) {
 }
 
 func newToken() string {
-	var b [24]byte
+	var b [tokenBytes]byte
 
 	_, _ = rand.Read(b[:])
 

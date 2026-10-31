@@ -9,12 +9,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/hewenyu/react-loop-agent/internal/agent"
 	"github.com/hewenyu/react-loop-agent/internal/api"
 	"github.com/hewenyu/react-loop-agent/internal/client"
 	"github.com/hewenyu/react-loop-agent/internal/sched"
@@ -22,6 +24,15 @@ import (
 
 // Version is set at build time.
 var Version = "dev"
+
+const (
+	// maxInput bounds what is read from stdin: a hook event, a prompt or a
+	// summary.
+	maxInput = 4 << 20
+	// hookTimeout is how long a hook waits for the daemon: never long, so a
+	// stuck daemon does not hold up the agent.
+	hookTimeout = 2 * time.Second
+)
 
 const usage = `rla: run coding agents from an outside scheduler
 
@@ -94,8 +105,12 @@ func run(args []string) error {
 // cmdHook forwards a hook event to the daemon. It never fails the hook: a
 // daemon that is gone must not stop the agent.
 func cmdHook() {
-	body, err := io.ReadAll(io.LimitReader(os.Stdin, 4<<20))
-	if err != nil || os.Getenv("RLA_AGENT_ID") == "" {
+	if os.Getenv(agent.EnvAgentID) == "" {
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(os.Stdin, maxInput))
+	if err != nil {
 		return
 	}
 
@@ -104,12 +119,12 @@ func cmdHook() {
 		return
 	}
 
-	c.HTTP.Timeout = 2 * time.Second
+	c.HTTP.Timeout = hookTimeout
 	_ = c.Do(context.Background(), "POST", "/api/hook", body, nil)
 }
 
 func cmdReport(args []string) error {
-	task := os.Getenv("RLA_TASK_ID")
+	task := os.Getenv(agent.EnvTaskID)
 
 	if len(args) > 0 && !isReport(args[0]) {
 		task, args = args[0], args[1:]
@@ -121,7 +136,7 @@ func cmdReport(args []string) error {
 
 	summary := strings.Join(args[1:], " ")
 	if summary == "-" {
-		b, err := io.ReadAll(os.Stdin)
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, maxInput))
 		if err != nil {
 			return err
 		}
@@ -144,7 +159,7 @@ func isReport(s string) bool {
 
 func cmdTask(args []string) error {
 	if len(args) == 2 && (args[0] == "cancel" || args[0] == "retry" || args[0] == "finish") {
-		return call("POST", "/api/tasks/"+args[1]+"/"+args[0], nil, nil)
+		return call("POST", "/api/tasks/"+url.PathEscape(args[1])+"/"+args[0], nil, nil)
 	}
 
 	if len(args) == 0 || args[0] != "add" {
@@ -161,12 +176,16 @@ func cmdTask(args []string) error {
 
 	prompt := strings.Join(fs.Args(), " ")
 	if prompt == "" || prompt == "-" {
-		b, err := io.ReadAll(os.Stdin)
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, maxInput))
 		if err != nil {
 			return err
 		}
 
 		prompt = string(b)
+	}
+
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("the prompt is empty")
 	}
 
 	abs, err := filepath.Abs(*dir)
@@ -197,6 +216,14 @@ func cmdRepo(args []string) error {
 		return err
 	}
 
+	if *n < 1 {
+		return fmt.Errorf("-concurrency must be at least 1, not %d", *n)
+	}
+
+	if fs.NArg() > 1 {
+		return errors.New("usage: rla repo add [-claude-bot] [-concurrency n] <dir>")
+	}
+
 	dir := "."
 	if fs.NArg() > 0 {
 		dir = fs.Arg(0)
@@ -224,16 +251,17 @@ func cmdList() error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "TASK\tSTATE\tAGENT\tFOLDER\tTITLE\tDETAIL")
+	// Errors surface at Flush: the tabwriter only buffers.
+	_, _ = fmt.Fprintln(w, "TASK\tSTATE\tAGENT\tFOLDER\tTITLE\tDETAIL")
 
 	for _, t := range st.Tasks {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.State, t.AgentID, filepath.Base(t.Cwd), t.Title, t.Detail)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.State, t.AgentID, filepath.Base(t.Cwd), t.Title, t.Detail)
 	}
 
-	fmt.Fprintln(w, "\nAGENT\tSTATUS\tTURNS\tFOLDER\tTASK\tDETAIL")
+	_, _ = fmt.Fprintln(w, "\nAGENT\tSTATUS\tTURNS\tFOLDER\tTASK\tDETAIL")
 
 	for _, a := range st.Agents {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", a.ID, a.Status, a.Turns, filepath.Base(a.Cwd), a.TaskID, a.Detail)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", a.ID, a.Status, a.Turns, filepath.Base(a.Cwd), a.TaskID, a.Detail)
 	}
 
 	return w.Flush()
@@ -245,7 +273,7 @@ func cmdRead(args []string) error {
 	}
 
 	var b []byte
-	if err := call("GET", "/api/agents/"+args[0]+"/screen", nil, &b); err != nil {
+	if err := call("GET", "/api/agents/"+url.PathEscape(args[0])+"/screen", nil, &b); err != nil {
 		return err
 	}
 
@@ -261,7 +289,7 @@ var keyNames = map[string]string{
 
 func cmdKeys(args []string) error {
 	if len(args) < 2 {
-		return errors.New("usage: rla keys <agent> <key>...")
+		return errors.New("usage: rla keys <agent> <key> [key ...]")
 	}
 
 	var b strings.Builder
@@ -274,7 +302,7 @@ func cmdKeys(args []string) error {
 		}
 	}
 
-	return call("POST", "/api/agents/"+args[0]+"/keys", map[string]string{"text": b.String()}, nil)
+	return call("POST", "/api/agents/"+url.PathEscape(args[0])+"/keys", map[string]string{"text": b.String()}, nil)
 }
 
 func call(method, path string, in, out any) error {

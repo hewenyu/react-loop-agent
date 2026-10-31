@@ -14,9 +14,9 @@ type Ring struct {
 	max int
 }
 
-// NewRing returns a ring that keeps at most max bytes.
-func NewRing(max int) *Ring {
-	return &Ring{max: max}
+// NewRing returns a ring that keeps at most size bytes.
+func NewRing(size int) *Ring {
+	return &Ring{max: size}
 }
 
 // Write appends p, dropping the oldest output beyond the limit. It trims

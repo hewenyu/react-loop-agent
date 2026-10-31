@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -21,9 +22,18 @@ var ErrNotFound = errors.New("no such agent")
 
 // hookEvents are the Claude Code hooks an agent reports to the daemon.
 var hookEvents = []string{
-	"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
-	"PermissionRequest", "Notification", "Stop", "SubagentStop", "SessionEnd",
+	EventSessionStart, EventUserPromptSubmit, EventPreToolUse, EventPostToolUse, EventPostToolUseFailure,
+	EventPermissionRequest, EventNotification, EventStop, EventSubagentStop, EventSessionEnd,
 }
+
+const (
+	// DefaultProgram is the agent command when none is configured.
+	DefaultProgram = "claude"
+	// DefaultRingSize is how much output a terminal keeps for replay.
+	DefaultRingSize = 4 << 20
+	// hookTimeout is how many seconds Claude gives a hook command.
+	hookTimeout = 5
+)
 
 // sessionVars are what a Claude Code session sets for the programs it runs.
 // An agent started by a daemon that was itself started from Claude Code
@@ -39,6 +49,15 @@ var sessionVars = map[string]bool{
 	"CLAUDE_CODE_SSE_PORT":          true,
 	"CLAUDE_CODE_PARENT_SESSION_ID": true,
 }
+
+// Environment the manager gives every agent.
+const (
+	EnvAgentID = "RLA_AGENT_ID"
+	EnvTaskID  = "RLA_TASK_ID"
+	// envPrefix marks the daemon's own variables: a daemon started from an
+	// agent must not hand its parent's on.
+	envPrefix = "RLA_"
+)
 
 // Config says how to start agents.
 type Config struct {
@@ -81,11 +100,11 @@ type Manager struct {
 // onChange.
 func NewManager(cfg Config, onChange func(Info)) *Manager {
 	if cfg.Program == "" {
-		cfg.Program = "claude"
+		cfg.Program = DefaultProgram
 	}
 
 	if cfg.RingSize <= 0 {
-		cfg.RingSize = 4 << 20
+		cfg.RingSize = DefaultRingSize
 	}
 
 	return &Manager{cfg: cfg, onChange: onChange, agents: map[string]*Agent{}}
@@ -142,13 +161,19 @@ func (m *Manager) Spawn(o SpawnOptions) (Info, error) {
 		return Info{}, err
 	}
 
-	if err := a.start(cmd); err != nil {
-		return Info{}, err
-	}
-
+	// Known before it starts: its first changes, even an exit right away,
+	// look it up by id.
 	m.mu.Lock()
 	m.agents[info.ID] = a
 	m.mu.Unlock()
+
+	if err := a.start(cmd); err != nil {
+		m.mu.Lock()
+		delete(m.agents, info.ID)
+		m.mu.Unlock()
+
+		return Info{}, err
+	}
 
 	return a.Info(), nil
 }
@@ -210,7 +235,9 @@ func (m *Manager) command(info Info, resume bool, prompt string) (*exec.Cmd, err
 		args = append(args, prompt)
 	}
 
-	cmd := exec.Command(path, args...)
+	// The agent outlives any request; Kill ends it, with signals to its
+	// process group.
+	cmd := exec.Command(path, args...) //nolint:noctx // see above
 	cmd.Dir = info.Cwd
 	cmd.Env = m.env(info)
 
@@ -237,7 +264,7 @@ func (m *Manager) settings() (string, error) {
 
 	hooks := map[string][]matcher{}
 	for _, e := range hookEvents {
-		hooks[e] = []matcher{{Hooks: []hook{{Type: "command", Command: m.cfg.HookCommand, Timeout: 5}}}}
+		hooks[e] = []matcher{{Hooks: []hook{{Type: "command", Command: m.cfg.HookCommand, Timeout: hookTimeout}}}}
 	}
 
 	settings := map[string]any{"hooks": hooks}
@@ -252,10 +279,10 @@ func (m *Manager) settings() (string, error) {
 
 func (m *Manager) env(info Info) []string {
 	extra := map[string]string{
-		"TERM":         "xterm-256color",
-		"COLORTERM":    "truecolor",
-		"RLA_AGENT_ID": info.ID,
-		"RLA_TASK_ID":  info.TaskID,
+		"TERM":      "xterm-256color",
+		"COLORTERM": "truecolor",
+		EnvAgentID:  info.ID,
+		EnvTaskID:   info.TaskID,
 	}
 
 	for k, v := range m.cfg.Env {
@@ -268,7 +295,7 @@ func (m *Manager) env(info Info) []string {
 		k, v, _ := strings.Cut(kv, "=")
 
 		switch {
-		case sessionVars[k] || strings.HasPrefix(k, "CLAUDE_CODE_MESSAGING_") || strings.HasPrefix(k, "RLA_"):
+		case sessionVars[k] || strings.HasPrefix(k, "CLAUDE_CODE_MESSAGING_") || strings.HasPrefix(k, envPrefix):
 			// Not a nested session; the daemon's own settings come below.
 			continue
 		case k == "PATH" && extra["PATH"] != "":
@@ -324,7 +351,9 @@ func (m *Manager) List() []Info {
 		infos = append(infos, a.Info())
 	}
 
-	slices.SortFunc(infos, func(x, y Info) int { return x.CreatedAt.Compare(y.CreatedAt) })
+	slices.SortFunc(infos, func(x, y Info) int {
+		return cmp.Or(x.CreatedAt.Compare(y.CreatedAt), strings.Compare(x.ID, y.ID))
+	})
 
 	return infos
 }
@@ -381,8 +410,10 @@ func (m *Manager) KillAll() {
 
 var idSeq atomic.Int64
 
+// newID is unique within a daemon: the time keeps ids apart across
+// restarts, the sequence within one millisecond.
 func newID(now time.Time) string {
-	return "a" + strconv.FormatInt(now.UnixMilli(), 36) + strconv.FormatInt(idSeq.Add(1)%36, 36)
+	return "a" + strconv.FormatInt(now.UnixMilli(), 36) + strconv.FormatInt(idSeq.Add(1), 36)
 }
 
 func newUUID() string {
@@ -422,12 +453,10 @@ func (m *Manager) WaitAgent(id string, timeout time.Duration) {
 		return
 	}
 
-	done := make(chan struct{})
-
-	go func() {
-		a.Wait()
-		close(done)
-	}()
+	done := a.Done()
+	if done == nil {
+		return
+	}
 
 	select {
 	case <-done:

@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - unconvert
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G204 # running the configured agent and claude-bot commands is the point
+        - G304 # files are read from the daemon's own folder and claude-bot inboxes
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

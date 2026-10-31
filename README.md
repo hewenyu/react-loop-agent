@@ -108,7 +108,8 @@ app/               Electron（main / preload / renderer：React + xterm.js）
 
 ```bash
 make test          # go test -race ./...
-cd app && npm run typecheck
+make lint          # go vet + golangci-lint（.golangci.yml）
+make check         # lint + test + APP 的 typecheck，提交前跑这个
 ```
 
 ## 还没做的
